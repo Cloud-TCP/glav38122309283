@@ -54,3 +54,8 @@ intended for production-grade security.
 
 Feel free to extend the interface, refine the encryption approach, or integrate richer text editing
 features.
+
+## Dependencies
+
+- In order to run this program you will need to have python installed on your `MacOS` or `Windows`
+  Device, you can install python from the offical website at `https://www.python.org/`. 3.12 or newer recommended.
