@@ -39,12 +39,10 @@ within the app.
 
 ### Documents (`.shpt`)
 
-Documents are JSON objects with version metadata and a salted ciphertext. Version 3 files derive
-separate encryption and authentication keys with PBKDF2-HMAC (200k rounds) from the password-derived
-key string, rotate the entire ~600-character string into every keystream block alongside the random
-salt and nonce, and authenticate the ciphertext plus a digest of the key string with HMAC-SHA-256.
-Older version 2 files (which lacked the key-string rotation) and the original version 1 prototype
-remain readable, but all new saves default to the strengthened version 3 format.
+Documents are JSON objects with version metadata and a salted ciphertext. The ciphertext is produced
+by XOR-ing the plaintext with a deterministic keystream derived from the password-generated key
+material. While suitable for demonstration purposes, the algorithm is intentionally simple and not
+intended for production-grade security.
 
 ## Development notes
 
