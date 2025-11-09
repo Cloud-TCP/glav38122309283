@@ -1,0 +1,1 @@
+"""Shopot application package."""
