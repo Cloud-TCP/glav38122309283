@@ -9,7 +9,7 @@ key string derived from patterned selections across the 3D key array.
 
 - **Home hub** to open existing documents, start a new one, or manage key arrays.
 - **Document editor** that decrypts `.shpt` files into formatted text, allows edits, and re-encrypts
-  content when saving.
+  content when saving, including embedded images with captions and download helpers.
 - **Key array manager** to generate new 10-layer, 77×77 arrays, browse each layer visually, and
   export them as `.shptk` files.
 - **Pattern-based key derivation** that maps each password digit to one of ten selection patterns,
@@ -39,10 +39,17 @@ within the app.
 
 ### Documents (`.shpt`)
 
-Documents are JSON objects with version metadata and a salted ciphertext. The ciphertext is produced
-by XOR-ing the plaintext with a deterministic keystream derived from the password-generated key
-material. While suitable for demonstration purposes, the algorithm is intentionally simple and not
-intended for production-grade security.
+Documents are JSON objects with version metadata and a salted ciphertext. Version 3 files derive
+separate encryption and authentication keys with PBKDF2-HMAC (200k rounds) from the password-derived
+key string, rotate the entire ~600-character string into every keystream block alongside the random
+salt and nonce, and authenticate the ciphertext plus a digest of the key string with HMAC-SHA-256.
+Older version 2 files (which lacked the key-string rotation) and the original version 1 prototype
+remain readable, but all new saves default to the strengthened version 3 format.
+
+Editor saves treat embedded images as inline blocks inside the plaintext prior to encryption. Each
+image occupies a sentinel section that begins with `::image::mime=...;caption64=...`, followed by a
+single-line base64 payload and a terminating `::end-image::` marker. The encoded caption text keeps
+line breaks out of the base64 region while allowing the viewer to rehydrate captions for display.
 
 ## Development notes
 
@@ -52,10 +59,16 @@ intended for production-grade security.
 - The GUI is organized into separate pages (`HomePage`, `DocumentEditorPage`, `KeyArrayPage`) managed
   by `ShopotApp`.
 
+The document editor now includes quick-formatting controls:
+
+- Italic, bold, and combined bold+italic buttons wrap the current selection in `*`, `**`, or `***`
+  markers respectively.
+- Heading helpers insert `# ` (H1) or `## ` (H2) at the start of the current line. Only prefixes at
+  the beginning of a line are treated as headings.
+- Editor text automatically wraps at the window edge for easier reading.
+- The **Add Image** tool embeds PNG/GIF files as base64-encoded blocks that render inline. Images
+  always occupy their own line, appear with an editable caption bar, and offer a quick "Download
+  Img" button to export the original asset.
+
 Feel free to extend the interface, refine the encryption approach, or integrate richer text editing
 features.
-
-## Dependencies
-
-- In order to run this program you will need to have python installed on your `MacOS` or `Windows`
-  Device, you can install python from the offical website at `https://www.python.org/`. 3.12 or newer recommended.

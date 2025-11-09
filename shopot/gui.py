@@ -1,15 +1,76 @@
 """Tkinter based user interface for the Shopot application."""
 from __future__ import annotations
 
+import base64
+import math
+import mimetypes
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from dataclasses import dataclass
 from typing import cast
 
 from .document import ShopotDocument
 from .keyfiles import KeyArray
 from .passwords import password_to_key_material, validate_password
+
+
+IMAGE_HEADER_PREFIX = "::image::"
+IMAGE_FOOTER = "::end-image::"
+
+
+@dataclass
+class ImageBlockData:
+    """Structured data for an embedded image block."""
+
+    mime: str
+    data: str
+    caption: str
+
+
+@dataclass
+class ImageWidget:
+    """Runtime metadata for an embedded image widget inside the editor."""
+
+    frame: tk.Widget
+    photo: tk.PhotoImage
+    caption_var: tk.StringVar
+    block: ImageBlockData
+
+
+def _encode_caption(value: str) -> str:
+    return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def _decode_caption(value: str) -> str:
+    try:
+        return base64.b64decode(value.encode("ascii")).decode("utf-8")
+    except Exception:
+        return value
+
+
+def _build_image_header(block: ImageBlockData) -> str:
+    caption64 = _encode_caption(block.caption)
+    return f"{IMAGE_HEADER_PREFIX}mime={block.mime};caption64={caption64}"
+
+
+def _parse_image_header(line: str) -> ImageBlockData | None:
+    if not line.startswith(IMAGE_HEADER_PREFIX):
+        return None
+    content = line[len(IMAGE_HEADER_PREFIX) :]
+    parts = content.split(";")
+    values: dict[str, str] = {}
+    for part in parts:
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        values[key] = value
+    mime = values.get("mime")
+    caption64 = values.get("caption64", "")
+    if not mime:
+        return None
+    caption = _decode_caption(caption64)
+    return ImageBlockData(mime=mime, data="", caption=caption)
 
 
 class ShopotApp(tk.Tk):
@@ -129,6 +190,9 @@ class HomePage(ttk.Frame):
 
 
 class DocumentEditorPage(ttk.Frame):
+    MAX_IMAGE_WIDTH = 600
+    MAX_IMAGE_HEIGHT = 400
+
     def __init__(self, parent: tk.Widget, controller: ShopotApp) -> None:
         super().__init__(parent)
         self.controller = controller
@@ -137,6 +201,7 @@ class DocumentEditorPage(ttk.Frame):
         self.current_key_path: str | None = None
         self.current_password: str | None = None
         self.key_array: KeyArray | None = None
+        self._image_widgets: dict[str, ImageWidget] = {}
 
         toolbar = ttk.Frame(self)
         toolbar.pack(fill="x")
@@ -147,10 +212,20 @@ class DocumentEditorPage(ttk.Frame):
         ttk.Button(toolbar, text="Save As", command=self.save_document_as).pack(side="left", padx=5)
         ttk.Button(toolbar, text="Set Key", command=self.set_key_context).pack(side="left", padx=5)
 
+        format_toolbar = ttk.Frame(self)
+        format_toolbar.pack(fill="x")
+
+        ttk.Button(format_toolbar, text="Italic", command=self.apply_italic).pack(side="left", padx=5, pady=2)
+        ttk.Button(format_toolbar, text="Bold", command=self.apply_bold).pack(side="left", padx=5, pady=2)
+        ttk.Button(format_toolbar, text="Bold + Italic", command=self.apply_bold_italic).pack(side="left", padx=5, pady=2)
+        ttk.Button(format_toolbar, text="H1", command=lambda: self.apply_heading(1)).pack(side="left", padx=5, pady=2)
+        ttk.Button(format_toolbar, text="H2", command=lambda: self.apply_heading(2)).pack(side="left", padx=5, pady=2)
+        ttk.Button(format_toolbar, text="Add Image", command=self.add_image).pack(side="left", padx=5, pady=2)
+
         self.status_var = tk.StringVar(value="No document loaded")
         ttk.Label(self, textvariable=self.status_var).pack(fill="x", padx=5, pady=5)
 
-        self.text_widget = tk.Text(self, wrap="word")
+        self.text_widget = tk.Text(self, wrap=tk.WORD)
         self.text_widget.pack(fill="both", expand=True, padx=5, pady=5)
 
     # Display ------------------------------------------------------------
@@ -163,8 +238,7 @@ class DocumentEditorPage(ttk.Frame):
         key_path: str | None,
         password: str | None,
     ) -> None:
-        self.text_widget.delete("1.0", tk.END)
-        self.text_widget.insert("1.0", text)
+        self._render_document_text(text)
         self.current_document_path = document_path
         self.key_array = key_array
         self.current_key_path = key_path
@@ -226,10 +300,274 @@ class DocumentEditorPage(ttk.Frame):
             return
         try:
             key_material = password_to_key_material(self.current_password, self.key_array)
-            document = ShopotDocument(text=self.text_widget.get("1.0", tk.END))
+            document_text = self._serialize_document_text()
+            document = ShopotDocument(text=document_text)
             document.save(path, key_material)
         except Exception as exc:
             messagebox.showerror("Save failed", str(exc), parent=self)
+
+    # Image helpers -----------------------------------------------------
+    def add_image(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select image",
+            filetypes=[("Image files", "*.png *.gif"), ("PNG", "*.png"), ("GIF", "*.gif"), ("All Files", "*")],
+        )
+        if not path:
+            return
+        mime, _ = mimetypes.guess_type(path)
+        if mime not in {"image/png", "image/gif"}:
+            messagebox.showerror("Unsupported image", "Only PNG and GIF images are supported for embedding.", parent=self)
+            return
+        try:
+            data = Path(path).read_bytes()
+        except OSError as exc:
+            messagebox.showerror("Failed to read image", str(exc), parent=self)
+            return
+        encoded = base64.b64encode(data).decode("ascii")
+        block = ImageBlockData(mime=mime or "image/png", data=encoded, caption="Image caption")
+        try:
+            self._insert_image_widget(block, self.text_widget.index("insert"))
+        except Exception as exc:
+            messagebox.showerror("Insert failed", str(exc), parent=self)
+
+    def _render_document_text(self, text: str) -> None:
+        self.text_widget.configure(state="normal")
+        self.text_widget.delete("1.0", tk.END)
+        self._image_widgets.clear()
+        segments = self._parse_document_text(text)
+        for kind, payload in segments:
+            if kind == "text":
+                if payload:
+                    self.text_widget.insert(tk.END, payload)
+            elif kind == "image":
+                self._insert_image_widget(payload, self.text_widget.index(tk.END))
+        self.text_widget.mark_set("insert", tk.END)
+        self.text_widget.focus_set()
+
+    def _parse_document_text(self, text: str) -> list[tuple[str, str | ImageBlockData]]:
+        segments: list[tuple[str, str | ImageBlockData]] = []
+        pos = 0
+        while True:
+            start = text.find(IMAGE_HEADER_PREFIX, pos)
+            if start == -1:
+                remaining = text[pos:]
+                if remaining:
+                    segments.append(("text", remaining))
+                break
+            before = text[pos:start]
+            if before:
+                segments.append(("text", before))
+            header_end = text.find("\n", start)
+            if header_end == -1:
+                segments.append(("text", text[start:]))
+                break
+            header_line = text[start:header_end]
+            data_start = header_end + 1
+            footer_token = "\n" + IMAGE_FOOTER
+            footer_pos = text.find(footer_token, data_start)
+            if footer_pos == -1:
+                segments.append(("text", text[start:]))
+                break
+            data = text[data_start:footer_pos]
+            block_end = footer_pos + len(footer_token)
+            trailing_newline = block_end < len(text) and text[block_end] == "\n"
+            if trailing_newline:
+                block_end += 1
+            pos = block_end
+            block = _parse_image_header(header_line)
+            if block is None:
+                raw = text[start:pos]
+                segments.append(("text", raw))
+                continue
+            block.data = data.strip()
+            segments.append(("image", block))
+        return segments
+
+    def _insert_image_widget(self, block: ImageBlockData, index: str) -> None:
+        index = self._normalize_image_index(index)
+        widget = self._create_image_frame(block)
+        self.text_widget.window_create(index, window=widget.frame)
+        after = self.text_widget.index(f"{index} +1c")
+        self.text_widget.insert(after, "\n")
+        self.text_widget.mark_set("insert", self.text_widget.index(f"{after} +1c"))
+
+    def _normalize_image_index(self, index: str) -> str:
+        index = self.text_widget.index(index)
+        if index == tk.END:
+            index = self.text_widget.index("end-1c")
+        if index in {"0.0", "-1.0"}:
+            index = "1.0"
+        if index != "1.0":
+            prev_char = self.text_widget.get(f"{index}-1c", index)
+            if prev_char != "\n":
+                self.text_widget.insert(index, "\n")
+                index = self.text_widget.index("insert")
+        line_start = self.text_widget.index(f"{index} linestart")
+        line_end = self.text_widget.index(f"{index} lineend")
+        line_text = self.text_widget.get(line_start, line_end)
+        if line_text.strip():
+            self.text_widget.insert(line_end, "\n")
+            index = self.text_widget.index(f"{line_end}+1c")
+        else:
+            index = line_start
+        return index
+
+    def _create_image_frame(self, block: ImageBlockData) -> ImageWidget:
+        frame = ttk.Frame(self.text_widget)
+        try:
+            photo = self._create_photo_image(block)
+        except tk.TclError as exc:
+            raise RuntimeError(f"Unable to display image: {exc}")
+        image_label = ttk.Label(frame, image=photo)
+        image_label.image = photo  # keep reference on the widget
+        image_label.pack(padx=5, pady=(5, 0))
+
+        caption_var = tk.StringVar(value=block.caption)
+        caption_frame = ttk.Frame(frame)
+        download_command = lambda b=block, v=caption_var: self._download_image(b, v)
+        ttk.Button(caption_frame, text="Download Img", command=download_command).pack(side="left", padx=(0, 6))
+        ttk.Entry(caption_frame, textvariable=caption_var, width=40).pack(side="left", fill="x", expand=True)
+        caption_frame.pack(fill="x", padx=5, pady=(2, 8))
+
+        widget = ImageWidget(frame=frame, photo=photo, caption_var=caption_var, block=block)
+        self._image_widgets[str(frame)] = widget
+        return widget
+
+    def _create_photo_image(self, block: ImageBlockData) -> tk.PhotoImage:
+        photo = tk.PhotoImage(data=block.data)
+        width = photo.width()
+        height = photo.height()
+        widget_width = self.text_widget.winfo_width() or 800
+        widget_height = self.text_widget.winfo_height() or 600
+        max_width = min(self.MAX_IMAGE_WIDTH, max(250, int(widget_width * 0.6)))
+        max_height = min(self.MAX_IMAGE_HEIGHT, max(250, int(widget_height * 0.6)))
+        scale = max(width / max_width if max_width else 1, height / max_height if max_height else 1)
+        if scale > 1:
+            factor = max(1, math.ceil(scale))
+            photo = photo.subsample(factor, factor)
+        return photo
+
+    def _download_image(self, block: ImageBlockData, caption_var: tk.StringVar) -> None:
+        caption = caption_var.get().strip() or "shopot-image"
+        safe_caption = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in caption)
+        ext = mimetypes.guess_extension(block.mime) or ".img"
+        path = filedialog.asksaveasfilename(
+            title="Save image",
+            defaultextension=ext,
+            initialfile=f"{safe_caption}{ext}",
+            filetypes=[(block.mime, f"*{ext}"), ("All Files", "*")],
+        )
+        if not path:
+            return
+        try:
+            data = base64.b64decode(block.data.encode("ascii"))
+            Path(path).write_bytes(data)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc), parent=self)
+            return
+        messagebox.showinfo("Saved", f"Image saved to {path}", parent=self)
+
+    def _gather_document_segments(self) -> list[tuple[str, str | ImageBlockData]]:
+        segments: list[tuple[str, str | ImageBlockData]] = []
+        buffer: list[str] = []
+        for kind, value, _ in self.text_widget.dump("1.0", "end-1c", text=True, window=True):
+            if kind == "text":
+                buffer.append(value)
+            elif kind == "window":
+                if buffer:
+                    segments.append(("text", "".join(buffer)))
+                    buffer.clear()
+                widget = self._image_widgets.get(value)
+                if widget:
+                    block = ImageBlockData(
+                        mime=widget.block.mime,
+                        data=widget.block.data,
+                        caption=widget.caption_var.get().strip(),
+                    )
+                    segments.append(("image", block))
+        if buffer:
+            segments.append(("text", "".join(buffer)))
+        return segments
+
+    def _serialize_document_text(self) -> str:
+        segments = self._gather_document_segments()
+        parts: list[str] = []
+        for kind, payload in segments:
+            if kind == "text":
+                parts.append(payload)
+                continue
+            block = payload  # type: ignore[assignment]
+            caption = block.caption.replace("\n", " ")
+            block.caption = caption
+            if parts and not parts[-1].endswith("\n"):
+                parts.append("\n")
+            header = _build_image_header(block)
+            parts.append(f"{header}\n{block.data}\n{IMAGE_FOOTER}\n")
+        return "".join(parts)
+
+    # Formatting helpers ------------------------------------------------
+    def apply_italic(self) -> None:
+        self._wrap_selection("*")
+
+    def apply_bold(self) -> None:
+        self._wrap_selection("**")
+
+    def apply_bold_italic(self) -> None:
+        self._wrap_selection("***")
+
+    def apply_heading(self, level: int) -> None:
+        prefix = "#" * level + " "
+        line_start = self.text_widget.index("insert linestart")
+        line_end = self.text_widget.index("insert lineend")
+        line_text = self.text_widget.get(line_start, line_end)
+
+        if "\uFFFC" in line_text:
+            messagebox.showinfo("Invalid target", "Headings cannot be applied to image lines.", parent=self)
+            return
+
+        stripped = line_text.lstrip()
+        if stripped.startswith("## "):
+            content = stripped[3:]
+        elif stripped.startswith("# "):
+            content = stripped[2:]
+        else:
+            content = stripped
+
+        new_line = prefix + content
+        self.text_widget.delete(line_start, line_end)
+        self.text_widget.insert(line_start, new_line)
+        self.text_widget.mark_set("insert", f"{line_start}+{len(prefix)}c")
+        self.text_widget.focus_set()
+
+    def _wrap_selection(self, marker: str) -> None:
+        try:
+            start = self.text_widget.index("sel.first")
+            end = self.text_widget.index("sel.last")
+        except tk.TclError:
+            messagebox.showinfo("No selection", "Highlight text before applying formatting.", parent=self)
+            return
+
+        if self._selection_contains_window(start, end):
+            messagebox.showinfo("Invalid selection", "Formatting cannot span embedded images.", parent=self)
+            return
+
+        selected_text = self.text_widget.get(start, end)
+        prefix = marker
+        suffix = marker
+        wrapped = f"{prefix}{selected_text}{suffix}"
+
+        self.text_widget.delete(start, end)
+        self.text_widget.insert(start, wrapped)
+
+        self.text_widget.tag_remove("sel", "1.0", tk.END)
+        self.text_widget.tag_add("sel", start, f"{start}+{len(wrapped)}c")
+        self.text_widget.focus_set()
+
+    def _selection_contains_window(self, start: str, end: str) -> bool:
+        for kind, _, _ in self.text_widget.dump(start, end, text=False, window=True):
+            if kind == "window":
+                return True
+        return False
 
 
 class KeyArrayPage(ttk.Frame):
