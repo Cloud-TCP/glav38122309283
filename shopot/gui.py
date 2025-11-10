@@ -4,7 +4,9 @@ from __future__ import annotations
 import base64
 import math
 import mimetypes
+import re
 import tkinter as tk
+import tkinter.font as tkfont
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -17,6 +19,42 @@ from .passwords import password_to_key_material, validate_password
 
 IMAGE_HEADER_PREFIX = "::image::"
 IMAGE_FOOTER = "::end-image::"
+
+
+_BOLD_ITALIC_PATTERN = re.compile(r"(?<!\*)\*\*\*(.+?)\*\*\*(?!\*)")
+_BOLD_PATTERN = re.compile(r"(?<!\*)\*\*(.+?)\*\*(?!\*)")
+_ITALIC_PATTERN = re.compile(r"(?<!\*)\*(.+?)\*(?!\*)")
+
+
+class _PasswordDialog(simpledialog.Dialog):
+    """Modal dialog that constrains password input to 10 numeric characters."""
+
+    def body(self, master: tk.Widget) -> tk.Entry:  # type: ignore[override]
+        ttk.Label(master, text="Enter 10-digit password").grid(row=0, column=0, padx=10, pady=(10, 0))
+        self._value = tk.StringVar()
+
+        def validate(proposed: str) -> bool:
+            return len(proposed) <= 10 and (proposed.isdigit() or proposed == "")
+
+        vcmd = master.register(validate)
+        entry = ttk.Entry(
+            master,
+            textvariable=self._value,
+            show="*",
+            validate="key",
+            validatecommand=(vcmd, "%P"),
+            width=15,
+        )
+        entry.grid(row=1, column=0, padx=10, pady=(5, 10))
+        return entry
+
+    def apply(self) -> None:  # type: ignore[override]
+        self.result = self._value.get()
+
+
+def _prompt_password(parent: tk.Widget) -> str | None:
+    dialog = _PasswordDialog(parent, "Password")
+    return dialog.result
 
 
 @dataclass
@@ -141,9 +179,7 @@ class ShopotApp(tk.Tk):
         )
         if not key_path:
             return None
-        password = simpledialog.askstring(
-            "Password", "Enter 10-digit password", parent=self, show="*"
-        )
+        password = _prompt_password(self)
         if password is None:
             return None
         try:
@@ -202,6 +238,8 @@ class DocumentEditorPage(ttk.Frame):
         self.current_password: str | None = None
         self.key_array: KeyArray | None = None
         self._image_widgets: dict[str, ImageWidget] = {}
+        self._refresh_pending = False
+        self._suspend_tag_refresh = False
 
         toolbar = ttk.Frame(self)
         toolbar.pack(fill="x")
@@ -227,8 +265,162 @@ class DocumentEditorPage(ttk.Frame):
 
         self.text_widget = tk.Text(self, wrap=tk.WORD)
         self.text_widget.pack(fill="both", expand=True, padx=5, pady=5)
+        self._setup_text_widget_formatting()
 
     # Display ------------------------------------------------------------
+    def _setup_text_widget_formatting(self) -> None:
+        base_font = tkfont.nametofont(self.text_widget.cget("font"))
+        try:
+            base_size = int(base_font.actual("size"))
+        except Exception:
+            base_size = 12
+        if base_size <= 0:
+            base_size = 12
+
+        self._italic_font = base_font.copy()
+        self._italic_font.configure(slant="italic")
+
+        self._bold_font = base_font.copy()
+        self._bold_font.configure(weight="bold")
+
+        self._bold_italic_font = base_font.copy()
+        self._bold_italic_font.configure(weight="bold", slant="italic")
+
+        heading1_size = max(base_size + 6, int(base_size * 1.6))
+        heading2_size = max(base_size + 4, int(base_size * 1.4))
+
+        self._heading1_font = base_font.copy()
+        self._heading1_font.configure(size=heading1_size, weight="bold")
+        self._heading1_italic_font = self._heading1_font.copy()
+        self._heading1_italic_font.configure(slant="italic")
+        self._heading1_bolditalic_font = self._heading1_font.copy()
+        self._heading1_bolditalic_font.configure(slant="italic")
+
+        self._heading2_font = base_font.copy()
+        self._heading2_font.configure(size=heading2_size, weight="bold")
+        self._heading2_italic_font = self._heading2_font.copy()
+        self._heading2_italic_font.configure(slant="italic")
+        self._heading2_bolditalic_font = self._heading2_font.copy()
+        self._heading2_bolditalic_font.configure(slant="italic")
+
+        self.text_widget.tag_configure("italic", font=self._italic_font)
+        self.text_widget.tag_configure("bold", font=self._bold_font)
+        self.text_widget.tag_configure("bolditalic", font=self._bold_italic_font)
+
+        self.text_widget.tag_configure("heading1", font=self._heading1_font, spacing1=6, spacing3=3)
+        self.text_widget.tag_configure(
+            "heading1_italic", font=self._heading1_italic_font, spacing1=6, spacing3=3
+        )
+        self.text_widget.tag_configure(
+            "heading1_bolditalic", font=self._heading1_bolditalic_font, spacing1=6, spacing3=3
+        )
+
+        self.text_widget.tag_configure("heading2", font=self._heading2_font, spacing1=4, spacing3=2)
+        self.text_widget.tag_configure(
+            "heading2_italic", font=self._heading2_italic_font, spacing1=4, spacing3=2
+        )
+        self.text_widget.tag_configure(
+            "heading2_bolditalic", font=self._heading2_bolditalic_font, spacing1=4, spacing3=2
+        )
+
+        self.text_widget.tag_raise("heading1_italic", "heading1")
+        self.text_widget.tag_raise("heading1_bolditalic", "heading1")
+        self.text_widget.tag_raise("heading2_italic", "heading2")
+        self.text_widget.tag_raise("heading2_bolditalic", "heading2")
+
+        self._inline_tag_mapping = {
+            0: {"italic": "italic", "bold": "bold", "bolditalic": "bolditalic"},
+            1: {
+                "italic": "heading1_italic",
+                "bold": "heading1",
+                "bolditalic": "heading1_bolditalic",
+            },
+            2: {
+                "italic": "heading2_italic",
+                "bold": "heading2",
+                "bolditalic": "heading2_bolditalic",
+            },
+        }
+
+        self.text_widget.bind("<<Modified>>", self._on_text_modified)
+        self.text_widget.edit_modified(False)
+
+    def _on_text_modified(self, _event: tk.Event[tk.Widget] | None) -> None:
+        self.text_widget.edit_modified(False)
+        if self._suspend_tag_refresh:
+            return
+        if not self._refresh_pending:
+            self._refresh_pending = True
+            self.after_idle(self._refresh_formatting_tags)
+
+    def _refresh_formatting_tags(self) -> None:
+        self._refresh_pending = False
+        if self._suspend_tag_refresh:
+            return
+
+        tags_to_clear = (
+            "italic",
+            "bold",
+            "bolditalic",
+            "heading1",
+            "heading1_italic",
+            "heading1_bolditalic",
+            "heading2",
+            "heading2_italic",
+            "heading2_bolditalic",
+        )
+        for tag in tags_to_clear:
+            self.text_widget.tag_remove(tag, "1.0", tk.END)
+
+        index = "1.0"
+        while True:
+            if self.text_widget.compare(index, ">=", "end"):
+                break
+            line_start = index
+            line_end = self.text_widget.index(f"{line_start} lineend")
+            line_text = self.text_widget.get(line_start, line_end)
+
+            heading_level = 0
+            stripped = line_text.lstrip()
+            if stripped.startswith("## "):
+                heading_level = 2
+            elif stripped.startswith("# "):
+                heading_level = 1
+
+            if heading_level:
+                heading_tag = self._inline_tag_mapping[heading_level]["bold"]
+                self.text_widget.tag_add(heading_tag, line_start, line_end)
+
+            if line_text and "\uFFFC" not in line_text:
+                self._apply_inline_markers(line_start, line_text, heading_level)
+
+            next_index = self.text_widget.index(f"{line_end}+1c")
+            if self.text_widget.compare(next_index, "<=", line_start):
+                break
+            index = next_index
+
+    def _apply_inline_markers(self, line_start: str, line_text: str, heading_level: int) -> None:
+        for match in _BOLD_ITALIC_PATTERN.finditer(line_text):
+            self._apply_inline_tag("bolditalic", heading_level, line_start, match.start(1), match.end(1))
+        for match in _BOLD_PATTERN.finditer(line_text):
+            self._apply_inline_tag("bold", heading_level, line_start, match.start(1), match.end(1))
+        for match in _ITALIC_PATTERN.finditer(line_text):
+            self._apply_inline_tag("italic", heading_level, line_start, match.start(1), match.end(1))
+
+    def _apply_inline_tag(
+        self, kind: str, heading_level: int, line_start: str, start_offset: int, end_offset: int
+    ) -> None:
+        tag_name = self._inline_tag_mapping.get(heading_level, {}).get(kind)
+        if not tag_name:
+            return
+        if start_offset >= end_offset:
+            return
+        start_index = f"{line_start}+{start_offset}c"
+        end_index = f"{line_start}+{end_offset}c"
+        if self.text_widget.compare(start_index, ">=", end_index):
+            return
+        self.text_widget.tag_add(tag_name, start_index, end_index)
+
     def display_document(
         self,
         *,
@@ -259,9 +451,7 @@ class DocumentEditorPage(ttk.Frame):
         )
         if not key_path:
             return
-        password = simpledialog.askstring(
-            "Password", "Enter 10-digit password", parent=self, show="*"
-        )
+        password = _prompt_password(self)
         if password is None:
             return
         try:
@@ -326,23 +516,33 @@ class DocumentEditorPage(ttk.Frame):
         encoded = base64.b64encode(data).decode("ascii")
         block = ImageBlockData(mime=mime or "image/png", data=encoded, caption="Image caption")
         try:
+            self._suspend_tag_refresh = True
             self._insert_image_widget(block, self.text_widget.index("insert"))
         except Exception as exc:
             messagebox.showerror("Insert failed", str(exc), parent=self)
+        finally:
+            self._suspend_tag_refresh = False
+        self._refresh_formatting_tags()
 
     def _render_document_text(self, text: str) -> None:
-        self.text_widget.configure(state="normal")
-        self.text_widget.delete("1.0", tk.END)
-        self._image_widgets.clear()
-        segments = self._parse_document_text(text)
-        for kind, payload in segments:
-            if kind == "text":
-                if payload:
-                    self.text_widget.insert(tk.END, payload)
-            elif kind == "image":
-                self._insert_image_widget(payload, self.text_widget.index(tk.END))
-        self.text_widget.mark_set("insert", tk.END)
-        self.text_widget.focus_set()
+        self._suspend_tag_refresh = True
+        try:
+            self.text_widget.configure(state="normal")
+            self.text_widget.delete("1.0", tk.END)
+            self._image_widgets.clear()
+            segments = self._parse_document_text(text)
+            for kind, payload in segments:
+                if kind == "text":
+                    if payload:
+                        self.text_widget.insert(tk.END, payload)
+                elif kind == "image":
+                    self._insert_image_widget(payload, self.text_widget.index(tk.END))
+            self.text_widget.mark_set("insert", tk.END)
+            self.text_widget.focus_set()
+        finally:
+            self._suspend_tag_refresh = False
+        self._refresh_formatting_tags()
+        self.text_widget.edit_modified(False)
 
     def _parse_document_text(self, text: str) -> list[tuple[str, str | ImageBlockData]]:
         segments: list[tuple[str, str | ImageBlockData]] = []
@@ -534,10 +734,15 @@ class DocumentEditorPage(ttk.Frame):
             content = stripped
 
         new_line = prefix + content
-        self.text_widget.delete(line_start, line_end)
-        self.text_widget.insert(line_start, new_line)
+        self._suspend_tag_refresh = True
+        try:
+            self.text_widget.delete(line_start, line_end)
+            self.text_widget.insert(line_start, new_line)
+        finally:
+            self._suspend_tag_refresh = False
         self.text_widget.mark_set("insert", f"{line_start}+{len(prefix)}c")
         self.text_widget.focus_set()
+        self._refresh_formatting_tags()
 
     def _wrap_selection(self, marker: str) -> None:
         try:
@@ -556,12 +761,17 @@ class DocumentEditorPage(ttk.Frame):
         suffix = marker
         wrapped = f"{prefix}{selected_text}{suffix}"
 
-        self.text_widget.delete(start, end)
-        self.text_widget.insert(start, wrapped)
+        self._suspend_tag_refresh = True
+        try:
+            self.text_widget.delete(start, end)
+            self.text_widget.insert(start, wrapped)
+        finally:
+            self._suspend_tag_refresh = False
 
         self.text_widget.tag_remove("sel", "1.0", tk.END)
         self.text_widget.tag_add("sel", start, f"{start}+{len(wrapped)}c")
         self.text_widget.focus_set()
+        self._refresh_formatting_tags()
 
     def _selection_contains_window(self, start: str, end: str) -> bool:
         for kind, _, _ in self.text_widget.dump(start, end, text=False, window=True):
