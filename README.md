@@ -66,9 +66,10 @@ The document editor now includes quick-formatting controls:
 - Heading helpers insert `# ` (H1) or `## ` (H2) at the start of the current line. Only prefixes at
   the beginning of a line are treated as headings.
 - Editor text automatically wraps at the window edge for easier reading.
-- The **Add Image** tool embeds PNG/GIF files as base64-encoded blocks that render inline. Images
-  always occupy their own line, appear with an editable caption bar, and offer a quick "Download
-  Img" button to export the original asset.
+- The **Add Image** tool embeds PNG, GIF, JPEG, WebP, and HEIC/HEIF files as base64-encoded blocks
+  that render inline. Images always occupy their own line, appear with an editable caption bar, and
+  offer a quick "Download Img" button to export the original asset. JPEG/WebP/HEIC previews require
+  Pillow; HEIC/HEIF decoding additionally needs a Pillow HEIF plugin such as `pillow-heif`.
 
 Feel free to extend the interface, refine the encryption approach, or integrate richer text editing
 features.

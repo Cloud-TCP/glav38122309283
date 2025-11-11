@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import math
 import mimetypes
 import re
@@ -12,18 +13,55 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import cast
 
+try:  # pragma: no cover - optional dependency
+    from PIL import Image, ImageOps, ImageTk
+
+    _PIL_AVAILABLE = True
+except Exception:  # pragma: no cover - Pillow not installed
+    Image = ImageOps = ImageTk = None  # type: ignore[assignment]
+    _PIL_AVAILABLE = False
+
+if _PIL_AVAILABLE:  # pragma: no cover - optional plugin
+    try:
+        from pillow_heif import register_heif_opener  # type: ignore
+
+        register_heif_opener()
+    except Exception:
+        pass
+
 from .document import ShopotDocument
 from .keyfiles import KeyArray
 from .passwords import password_to_key_material, validate_password
 
 
+for _ext, _mime in (
+    (".heic", "image/heic"),
+    (".heif", "image/heif"),
+    (".webp", "image/webp"),
+):
+    mimetypes.add_type(_mime, _ext)
+
+
 IMAGE_HEADER_PREFIX = "::image::"
 IMAGE_FOOTER = "::end-image::"
+
+_STATIC_IMAGE_MIMES = {
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+}
+
+_GIF_MIME = "image/gif"
 
 
 _BOLD_ITALIC_PATTERN = re.compile(r"(?<!\*)\*\*\*(.+?)\*\*\*(?!\*)")
 _BOLD_PATTERN = re.compile(r"(?<!\*)\*\*(.+?)\*\*(?!\*)")
 _ITALIC_PATTERN = re.compile(r"(?<!\*)\*(.+?)\*(?!\*)")
+
+_SUPPORTED_IMAGE_MIMES = _STATIC_IMAGE_MIMES | {_GIF_MIME}
 
 
 class _PasswordDialog(simpledialog.Dialog):
@@ -235,13 +273,17 @@ class ShopotApp(tk.Tk):
             messagebox.showerror("Failed to open", str(exc), parent=self)
             return
         editor = cast(DocumentEditorPage, self.frames["DocumentEditorPage"])
-        editor.display_document(
-            text=document.text,
-            document_path=doc_path,
-            key_array=key_context.key_array,
-            key_path=key_context.key_path,
-            password=key_context.password,
-        )
+        try:
+            editor.display_document(
+                text=document.text,
+                document_path=doc_path,
+                key_array=key_context.key_array,
+                key_path=key_context.key_path,
+                password=key_context.password,
+            )
+        except Exception as exc:
+            messagebox.showerror("Display failed", str(exc), parent=self)
+            return
         self.show_frame("DocumentEditorPage")
 
     def create_new_document(self) -> None:
@@ -581,21 +623,51 @@ class DocumentEditorPage(ttk.Frame):
     def add_image(self) -> None:
         path = filedialog.askopenfilename(
             title="Select image",
-            filetypes=[("Image files", "*.png *.gif"), ("PNG", "*.png"), ("GIF", "*.gif"), ("All Files", "*")],
+            filetypes=[
+                (
+                    "Image files",
+                    "*.png *.gif *.jpg *.jpeg *.webp *.heic *.heif",
+                ),
+                ("PNG", "*.png"),
+                ("GIF", "*.gif"),
+                ("JPEG", "*.jpg *.jpeg"),
+                ("WebP", "*.webp"),
+                ("HEIC/HEIF", "*.heic *.heif"),
+                ("All Files", "*"),
+            ],
         )
         if not path:
             return
         mime, _ = mimetypes.guess_type(path)
-        if mime not in {"image/png", "image/gif"}:
-            messagebox.showerror("Unsupported image", "Only PNG and GIF images are supported for embedding.", parent=self)
+        if mime and mime not in _SUPPORTED_IMAGE_MIMES:
+            messagebox.showerror(
+                "Unsupported image",
+                "Only PNG, GIF, JPEG, WebP, and HEIC/HEIF images are supported for embedding.",
+                parent=self,
+            )
             return
         try:
             data = Path(path).read_bytes()
         except OSError as exc:
             messagebox.showerror("Failed to read image", str(exc), parent=self)
             return
+        mime = mime or self._detect_mime_from_bytes(data)
+        if mime not in _SUPPORTED_IMAGE_MIMES:
+            messagebox.showerror(
+                "Unsupported image",
+                "Only PNG, GIF, JPEG, WebP, and HEIC/HEIF images are supported for embedding.",
+                parent=self,
+            )
+            return
+        if mime in (_STATIC_IMAGE_MIMES - {"image/png"}) and (not _PIL_AVAILABLE or Image is None):
+            messagebox.showerror(
+                "Missing dependency",
+                "Displaying JPEG, WebP, and HEIC/HEIF images requires Pillow. Install Pillow to embed this format.",
+                parent=self,
+            )
+            return
         encoded = base64.b64encode(data).decode("ascii")
-        block = ImageBlockData(mime=mime or "image/png", data=encoded, caption="Image caption")
+        block = ImageBlockData(mime=mime, data=encoded, caption="Image caption")
         try:
             self._suspend_tag_refresh = True
             self._insert_image_widget(block, self.text_widget.index("insert"))
@@ -723,27 +795,90 @@ class DocumentEditorPage(ttk.Frame):
         self._start_image_animation(widget)
         return widget
 
+    def _detect_mime_from_bytes(self, data: bytes) -> str:
+        if not _PIL_AVAILABLE or Image is None:
+            return "application/octet-stream"
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                fmt = image.format
+                if fmt:
+                    mime = Image.MIME.get(fmt)
+                    if mime:
+                        return mime
+        except Exception:
+            pass
+        return "application/octet-stream"
+
     def _create_photo_image(
         self, block: ImageBlockData
     ) -> tuple[tk.PhotoImage, list[tk.PhotoImage] | None, list[int] | None]:
-        base_photo = tk.PhotoImage(data=block.data)
-        width = base_photo.width()
-        height = base_photo.height()
         widget_width = self.text_widget.winfo_width() or 800
         widget_height = self.text_widget.winfo_height() or 600
         max_width = min(self.MAX_IMAGE_WIDTH, max(250, int(widget_width * 0.6)))
         max_height = min(self.MAX_IMAGE_HEIGHT, max(250, int(widget_height * 0.6)))
-        scale = max(width / max_width if max_width else 1, height / max_height if max_height else 1)
-        subsample_factor = max(1, math.ceil(scale)) if scale > 1 else 1
-        photo = base_photo if subsample_factor == 1 else base_photo.subsample(subsample_factor, subsample_factor)
 
-        frames: list[tk.PhotoImage] | None = None
-        delays: list[int] | None = None
-        if block.mime == "image/gif":
+        if block.mime == _GIF_MIME:
+            base_photo = tk.PhotoImage(data=block.data)
+            width = base_photo.width()
+            height = base_photo.height()
+            scale = max(width / max_width if max_width else 1, height / max_height if max_height else 1)
+            subsample_factor = max(1, math.ceil(scale)) if scale > 1 else 1
+            photo = base_photo if subsample_factor == 1 else base_photo.subsample(subsample_factor, subsample_factor)
             frames, delays = self._load_gif_frames(block.data, subsample_factor)
             if frames:
                 photo = frames[0]
-        return photo, frames, delays
+            return photo, frames, delays
+
+        try:
+            base_photo = tk.PhotoImage(data=block.data)
+        except tk.TclError:
+            base_photo = None
+
+        if base_photo is not None:
+            width = base_photo.width()
+            height = base_photo.height()
+            scale = max(width / max_width if max_width else 1, height / max_height if max_height else 1)
+            subsample_factor = max(1, math.ceil(scale)) if scale > 1 else 1
+            photo = base_photo if subsample_factor == 1 else base_photo.subsample(subsample_factor, subsample_factor)
+            return photo, None, None
+
+        if not _PIL_AVAILABLE or Image is None or ImageTk is None:
+            raise RuntimeError(
+                "Displaying this image type requires Pillow. Install Pillow to enable JPEG, WebP, or HEIC/HEIF support."
+            )
+
+        try:
+            raw = base64.b64decode(block.data.encode("ascii"))
+        except Exception as exc:  # pragma: no cover - malformed base64
+            raise RuntimeError("Embedded image data is not valid base64.") from exc
+
+        try:
+            image = Image.open(io.BytesIO(raw))
+        except Exception as exc:  # pragma: no cover - unsupported format
+            if block.mime in {"image/heic", "image/heif"}:
+                raise RuntimeError(
+                    "HEIC/HEIF preview requires Pillow with HEIF support (e.g., install pillow-heif)."
+                ) from exc
+            raise RuntimeError(str(exc)) from exc
+
+        try:
+            if ImageOps is not None:
+                image = ImageOps.exif_transpose(image)
+        except Exception:
+            pass
+
+        if image.mode not in {"RGB", "RGBA"}:
+            image = image.convert("RGBA")
+
+        width, height = image.size
+        scale = max(width / max_width if max_width else 1, height / max_height if max_height else 1)
+        if scale > 1:
+            new_width = max(1, int(width / scale))
+            new_height = max(1, int(height / scale))
+            image = image.resize((new_width, new_height), Image.LANCZOS)
+
+        photo = ImageTk.PhotoImage(image)
+        return photo, None, None
 
     def _load_gif_frames(
         self, data: str, subsample_factor: int
@@ -812,6 +947,8 @@ class DocumentEditorPage(ttk.Frame):
         caption = caption_var.get().strip() or "shopot-image"
         safe_caption = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in caption)
         ext = mimetypes.guess_extension(block.mime) or ".img"
+        if ext == ".jpe":
+            ext = ".jpg"
         path = filedialog.asksaveasfilename(
             title="Save image",
             defaultextension=ext,
