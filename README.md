@@ -1,4 +1,4 @@
-# Shopot File Viewer
+# Shopot File Viewer v0.21
 
 Shopot File Viewer is a cross-platform desktop prototype written in Python with Tkinter. The
 application can create and open encrypted `.shpt` documents using companion key-array files with the
