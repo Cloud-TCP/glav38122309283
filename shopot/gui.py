@@ -71,9 +71,14 @@ class ImageWidget:
     """Runtime metadata for an embedded image widget inside the editor."""
 
     frame: tk.Widget
+    label: ttk.Label
     photo: tk.PhotoImage
     caption_var: tk.StringVar
     block: ImageBlockData
+    frames: list[tk.PhotoImage] | None = None
+    delays: list[int] | None = None
+    current_frame: int = 0
+    after_id: str | None = None
 
 
 def _encode_caption(value: str) -> str:
@@ -109,6 +114,82 @@ def _parse_image_header(line: str) -> ImageBlockData | None:
         return None
     caption = _decode_caption(caption64)
     return ImageBlockData(mime=mime, data="", caption=caption)
+
+
+def _skip_gif_sub_blocks(data: bytes, pos: int) -> int:
+    """Advance ``pos`` past a sequence of GIF sub-blocks."""
+
+    while pos < len(data):
+        block_len = data[pos]
+        pos += 1
+        if block_len == 0:
+            break
+        pos += block_len
+    return pos
+
+
+def _gif_delays_from_bytes(data: bytes, frame_count: int) -> list[int]:
+    """Extract frame delays (in milliseconds) from GIF binary data."""
+
+    if frame_count <= 0:
+        return []
+    if not (data.startswith(b"GIF87a") or data.startswith(b"GIF89a")):
+        return []
+
+    pos = 6  # header consumed
+    if len(data) < pos + 7:
+        return []
+    packed_fields = data[pos + 4]
+    pos += 7  # logical screen descriptor
+    if packed_fields & 0x80:
+        table_size = 3 * (2 ** ((packed_fields & 0x07) + 1))
+        pos += table_size
+
+    delays: list[int] = []
+    current_delay = 100
+    while pos < len(data) and len(delays) < frame_count:
+        block_type = data[pos]
+        pos += 1
+        if block_type == 0x3B:  # trailer
+            break
+        if block_type == 0x21:  # extension
+            if pos >= len(data):
+                break
+            label = data[pos]
+            pos += 1
+            if label == 0xF9 and pos < len(data):  # graphics control extension
+                block_size = data[pos]
+                pos += 1
+                block_data = data[pos : pos + block_size]
+                pos += block_size
+                if len(block_data) >= 4:
+                    delay_cs = int.from_bytes(block_data[1:3], "little")
+                    current_delay = delay_cs * 10
+                    if current_delay <= 0:
+                        current_delay = 100
+                if pos < len(data):
+                    pos += 1  # block terminator
+            else:
+                pos = _skip_gif_sub_blocks(data, pos)
+        elif block_type == 0x2C:  # image descriptor
+            if pos + 9 > len(data):
+                break
+            descriptor = data[pos : pos + 9]
+            pos += 9
+            packed = descriptor[8]
+            if packed & 0x80:
+                table_size = 3 * (2 ** ((packed & 0x07) + 1))
+                pos += table_size
+            if pos >= len(data):
+                break
+            pos += 1  # LZW minimum code size
+            pos = _skip_gif_sub_blocks(data, pos)
+            delays.append(max(current_delay, 20))
+            current_delay = 100
+        else:
+            break
+
+    return delays
 
 
 class ShopotApp(tk.Tk):
@@ -528,8 +609,8 @@ class DocumentEditorPage(ttk.Frame):
         self._suspend_tag_refresh = True
         try:
             self.text_widget.configure(state="normal")
+            self._clear_registered_images()
             self.text_widget.delete("1.0", tk.END)
-            self._image_widgets.clear()
             segments = self._parse_document_text(text)
             for kind, payload in segments:
                 if kind == "text":
@@ -615,7 +696,7 @@ class DocumentEditorPage(ttk.Frame):
     def _create_image_frame(self, block: ImageBlockData) -> ImageWidget:
         frame = ttk.Frame(self.text_widget)
         try:
-            photo = self._create_photo_image(block)
+            photo, frames, delays = self._create_photo_image(block)
         except tk.TclError as exc:
             raise RuntimeError(f"Unable to display image: {exc}")
         image_label = ttk.Label(frame, image=photo)
@@ -629,23 +710,103 @@ class DocumentEditorPage(ttk.Frame):
         ttk.Entry(caption_frame, textvariable=caption_var, width=40).pack(side="left", fill="x", expand=True)
         caption_frame.pack(fill="x", padx=5, pady=(2, 8))
 
-        widget = ImageWidget(frame=frame, photo=photo, caption_var=caption_var, block=block)
+        widget = ImageWidget(
+            frame=frame,
+            label=image_label,
+            photo=photo,
+            caption_var=caption_var,
+            block=block,
+            frames=frames,
+            delays=delays,
+        )
         self._image_widgets[str(frame)] = widget
+        self._start_image_animation(widget)
         return widget
 
-    def _create_photo_image(self, block: ImageBlockData) -> tk.PhotoImage:
-        photo = tk.PhotoImage(data=block.data)
-        width = photo.width()
-        height = photo.height()
+    def _create_photo_image(
+        self, block: ImageBlockData
+    ) -> tuple[tk.PhotoImage, list[tk.PhotoImage] | None, list[int] | None]:
+        base_photo = tk.PhotoImage(data=block.data)
+        width = base_photo.width()
+        height = base_photo.height()
         widget_width = self.text_widget.winfo_width() or 800
         widget_height = self.text_widget.winfo_height() or 600
         max_width = min(self.MAX_IMAGE_WIDTH, max(250, int(widget_width * 0.6)))
         max_height = min(self.MAX_IMAGE_HEIGHT, max(250, int(widget_height * 0.6)))
         scale = max(width / max_width if max_width else 1, height / max_height if max_height else 1)
-        if scale > 1:
-            factor = max(1, math.ceil(scale))
-            photo = photo.subsample(factor, factor)
-        return photo
+        subsample_factor = max(1, math.ceil(scale)) if scale > 1 else 1
+        photo = base_photo if subsample_factor == 1 else base_photo.subsample(subsample_factor, subsample_factor)
+
+        frames: list[tk.PhotoImage] | None = None
+        delays: list[int] | None = None
+        if block.mime == "image/gif":
+            frames, delays = self._load_gif_frames(block.data, subsample_factor)
+            if frames:
+                photo = frames[0]
+        return photo, frames, delays
+
+    def _load_gif_frames(
+        self, data: str, subsample_factor: int
+    ) -> tuple[list[tk.PhotoImage], list[int]]:
+        frames: list[tk.PhotoImage] = []
+        index = 0
+        while True:
+            try:
+                frame = tk.PhotoImage(data=data, format=f"gif -index {index}")
+            except tk.TclError:
+                break
+            if subsample_factor > 1:
+                frame = frame.subsample(subsample_factor, subsample_factor)
+            frames.append(frame)
+            index += 1
+
+        if not frames:
+            return [], []
+
+        try:
+            raw = base64.b64decode(data.encode("ascii"))
+        except Exception:
+            return frames, [100] * len(frames)
+
+        delays = _gif_delays_from_bytes(raw, len(frames))
+        if not delays:
+            delays = [100] * len(frames)
+        elif len(delays) < len(frames):
+            last = delays[-1] if delays else 100
+            delays.extend([last] * (len(frames) - len(delays)))
+        return frames, delays
+
+    def _start_image_animation(self, widget: ImageWidget) -> None:
+        if not widget.frames or len(widget.frames) <= 1:
+            return
+        widget.current_frame = 0
+        self._schedule_next_frame(widget)
+
+    def _schedule_next_frame(self, widget: ImageWidget) -> None:
+        if not widget.frames:
+            return
+        delay = 100
+        if widget.delays:
+            delay = widget.delays[widget.current_frame % len(widget.frames)]
+        frame = widget.frames[widget.current_frame % len(widget.frames)]
+        widget.label.configure(image=frame)
+        widget.label.image = frame
+        widget.current_frame = (widget.current_frame + 1) % len(widget.frames)
+        delay = max(delay, 20)
+        widget.after_id = self.text_widget.after(delay, lambda w=widget: self._schedule_next_frame(w))
+
+    def _stop_image_animation(self, widget: ImageWidget) -> None:
+        if widget.after_id:
+            try:
+                self.text_widget.after_cancel(widget.after_id)
+            except Exception:
+                pass
+            widget.after_id = None
+
+    def _clear_registered_images(self) -> None:
+        for widget in self._image_widgets.values():
+            self._stop_image_animation(widget)
+        self._image_widgets.clear()
 
     def _download_image(self, block: ImageBlockData, caption_var: tk.StringVar) -> None:
         caption = caption_var.get().strip() or "shopot-image"
